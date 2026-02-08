@@ -1,0 +1,115 @@
+import cv2
+import numpy as np
+from ultralytics import YOLO
+import mediapipe as mp
+from mediapipe.tasks import python
+from mediapipe.tasks.python import vision
+import pyautogui
+import os, requests, math
+
+# --- 1. SETUP ---
+pyautogui.FAILSAFE = False
+screen_w, screen_h = pyautogui.size()
+smoothening = 2 
+prev_x, prev_y = 0, 0
+is_minimized = False 
+
+body_model = YOLO('yolov8n-pose.pt')
+download_path = 'hand_landmarker.task'
+if not os.path.exists(download_path):
+    url = "https://storage.googleapis.com/mediapipe-models/hand_landmarker/hand_landmarker/float16/1/hand_landmarker.task"
+    r = requests.get(url, allow_redirects=True)
+    with open(download_path, 'wb') as f: f.write(r.content)
+
+hand_detector = vision.HandLandmarker.create_from_options(vision.HandLandmarkerOptions(
+    base_options=python.BaseOptions(model_asset_path=download_path), num_hands=2))
+
+# Body and Hand Connections
+HAND_BONES = [(0,1), (1,2), (2,3), (3,4), (0,5), (5,6), (6,7), (7,8), (9,10), (10,11), (11,12), (13,14), (14,15), (15,16), (0,17), (17,18), (18,19), (19,20), (5,9), (9,13), (13,17)]
+BODY_LINKS = [(5,6), (5,7), (7,9), (6,8), (8,10), (5,11), (6,12), (11,12), (11,13), (13,15), (12,14), (14,16)]
+
+cap = cv2.VideoCapture(0)
+cv2.namedWindow('Matrix HUD', cv2.WINDOW_NORMAL)
+
+print("STEALTH MODE: Press 's' to toggle Full Body HUD / Desktop View. Press 'q' to quit.")
+
+while cap.isOpened():
+    success, frame = cap.read()
+    if not success: break
+    frame = cv2.flip(frame, 1)
+    h, w, _ = frame.shape
+    skele_screen = np.zeros((h, w, 3), dtype=np.uint8) 
+    
+    # --- 2. FULL BODY TRACKING (YOLO) ---
+    body_res = body_model(frame, stream=True, verbose=False, conf=0.2)
+    for r in body_res:
+        if r.keypoints is not None:
+            for i in range(len(r.keypoints.xy)):
+                kpts, conf = r.keypoints.xy[i].cpu().numpy(), r.keypoints.conf[i].cpu().numpy()
+                
+                # HEAD LOGIC (Round Head + Neck)
+                if conf[0] > 0.3 and conf[5] > 0.3 and conf[6] > 0.3:
+                    nose = (int(kpts[0][0]), int(kpts[0][1]))
+                    head_radius = int(math.dist(kpts[5], kpts[6]) * 0.35) 
+                    cv2.circle(skele_screen, nose, head_radius, (0, 255, 0), 2)
+                    # Neck Lines
+                    cv2.line(skele_screen, (nose[0]-15, nose[1]+head_radius-5), (int(kpts[5][0]), int(kpts[5][1])), (0, 255, 0), 2)
+                    cv2.line(skele_screen, (nose[0]+15, nose[1]+head_radius-5), (int(kpts[6][0]), int(kpts[6][1])), (0, 255, 0), 2)
+
+                # FULL BODY BONES
+                for s, e in BODY_LINKS:
+                    if conf[s] > 0.2 and conf[e] > 0.2:
+                        p1 = (int(kpts[s][0]), int(kpts[s][1]))
+                        p2 = (int(kpts[e][0]), int(kpts[e][1]))
+                        # Draw if points are within camera bounds
+                        if (0 <= p1[0] < w and 0 <= p1[1] < h) and (0 <= p2[0] < w and 0 <= p2[1] < h):
+                            cv2.line(skele_screen, p1, p2, (0, 255, 0), 2)
+
+    # --- 3. HAND & MOUSE LOGIC (Mediapipe) ---
+    mp_image = mp.Image(image_format=mp.ImageFormat.SRGB, data=cv2.cvtColor(frame, cv2.COLOR_BGR2RGB))
+    hand_res = hand_detector.detect(mp_image)
+
+    if hand_res.hand_landmarks:
+        for landmarks in hand_res.hand_landmarks:
+            pts = [(int(lm.x * w), int(lm.y * h)) for lm in landmarks]
+            ix, iy = pts[8] # Index
+            tx, ty = pts[4] # Thumb
+            
+            # Map Finger to Screen
+            target_x, target_y = (ix / w) * screen_w, (iy / h) * screen_h
+            curr_x = prev_x + (target_x - prev_x) / smoothening
+            curr_y = prev_y + (target_y - prev_y) / smoothening
+            
+            # Pinch to Click
+            if math.dist((ix, iy), (tx, ty)) < 25:
+                pyautogui.mouseDown()
+                cv2.circle(skele_screen, (ix, iy), 35, (0, 255, 255), 2)
+            else:
+                pyautogui.mouseUp()
+            
+            pyautogui.moveTo(curr_x, curr_y)
+            prev_x, prev_y = curr_x, curr_y
+
+            # Draw Hand Skeleton
+            for start, end in HAND_BONES: cv2.line(skele_screen, pts[start], pts[end], (0, 255, 0), 1)
+            for pt in pts: cv2.circle(skele_screen, pt, 6, (0, 255, 0), -1)
+
+    # --- 4. DISPLAY / STEALTH TOGGLE ---
+    if not is_minimized:
+        # Standard View: Webcam + Hologram
+        cv2.imshow('Matrix HUD', np.hstack((frame, skele_screen)))
+    else:
+        # Stealth View: Minimize window to allow desktop interaction
+        cv2.imshow('Matrix HUD', np.zeros((1, 1, 3), dtype=np.uint8)) 
+        # Move window to corner so it doesn't block icons
+        cv2.moveWindow('Matrix HUD', screen_w - 10, screen_h - 10)
+
+    key = cv2.waitKey(1) & 0xFF
+    if key == ord('q'): break
+    if key == ord('s'): 
+        is_minimized = not is_minimized
+        if not is_minimized:
+            cv2.resizeWindow('Matrix HUD', w*2, h)
+
+cap.release()
+cv2.destroyAllWindows()
