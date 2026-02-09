@@ -1,0 +1,99 @@
+import cv2
+import numpy as np
+from ultralytics import YOLO
+import mediapipe as mp
+from mediapipe.tasks import python
+from mediapipe.tasks.python import vision
+import os, requests, math
+
+# --- 1. SETUP ---
+body_model = YOLO('yolov8n-pose.pt')
+
+download_path = 'hand_landmarker.task'
+if not os.path.exists(download_path):
+    url = "https://storage.googleapis.com/mediapipe-models/hand_landmarker/hand_landmarker/float16/1/hand_landmarker.task"
+    r = requests.get(url, allow_redirects=True)
+    with open(download_path, 'wb') as f: f.write(r.content)
+
+hand_detector = vision.HandLandmarker.create_from_options(vision.HandLandmarkerOptions(
+    base_options=python.BaseOptions(model_asset_path=download_path), num_hands=2))
+
+BODY_LINKS = [(5,6), (5,7), (7,9), (6,8), (8,10), (5,11), (6,12), (11,12), (11,13), (13,15), (12,14), (14,16)]
+HAND_BONES = [(0,1), (1,2), (2,3), (3,4), (0,5), (5,6), (6,7), (7,8), (9,10), (10,11), (11,12), (13,14), (14,15), (15,16), (0,17), (17,18), (18,19), (19,20), (5,9), (9,13), (13,17)]
+
+cap = cv2.VideoCapture(0)
+cv2.namedWindow('Laser Paint HUD', cv2.WINDOW_NORMAL)
+
+canvas = None
+prev_points = {} 
+current_color = (0, 255, 255) # Default Yellow
+
+# Define Colors for Palette: (Name, BGR Color)
+COLORS = [("Cyan", (255, 255, 0)), ("Yellow", (0, 255, 255)), ("Red", (0, 0, 255)), ("Green", (0, 255, 0))]
+
+while cap.isOpened():
+    success, frame = cap.read()
+    if not success: break
+    
+    frame = cv2.flip(frame, 1)
+    h, w, _ = frame.shape
+    if canvas is None: canvas = np.zeros((h, w, 3), dtype=np.uint8)
+    hologram = np.zeros((h, w, 3), dtype=np.uint8) 
+
+    # --- 2. DRAW COLOR PALETTE (Bottom Right) ---
+    for i, (name, col) in enumerate(COLORS):
+        x1, y1 = w - 110, h - (160 - (i * 40))
+        x2, y2 = w - 10, h - (125 - (i * 40))
+        cv2.rectangle(frame, (x1, y1), (x2, y2), col, -1)
+        cv2.rectangle(frame, (x1, y1), (x2, y2), (255, 255, 255), 1)
+        cv2.putText(frame, name[0], (x1 + 5, y1 + 25), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0,0,0), 2)
+
+    # --- 3. BODY & HANDS ---
+    body_res = body_model(frame, stream=True, verbose=False, conf=0.2, imgsz=320)
+    for r in body_res:
+        if r.keypoints is not None:
+            for i in range(len(r.keypoints.xy)):
+                kpts, conf = r.keypoints.xy[i].cpu().numpy(), r.keypoints.conf[i].cpu().numpy()
+                for s, e in BODY_LINKS:
+                    if conf[s] > 0.2 and conf[e] > 0.2:
+                        cv2.line(hologram, (int(kpts[s][0]), int(kpts[s][1])), (int(kpts[e][0]), int(kpts[e][1])), (0, 255, 0), 2)
+
+    mp_image = mp.Image(image_format=mp.ImageFormat.SRGB, data=cv2.cvtColor(frame, cv2.COLOR_BGR2RGB))
+    hand_res = hand_detector.detect(mp_image)
+
+    current_hand_tips = []
+    if hand_res.hand_landmarks:
+        for hand_idx, landmarks in enumerate(hand_res.hand_landmarks):
+            pts = [(int(lm.x * w), int(lm.y * h)) for lm in landmarks]
+            current_hand_tips.append(pts)
+            idx_tip, thumb_tip = pts[8], pts[4]
+
+            # CHECK FOR COLOR CHANGE (Hover over boxes)
+            for i, (name, col) in enumerate(COLORS):
+                x1, y1 = w - 110, h - (160 - (i * 40))
+                x2, y2 = w - 10, h - (125 - (i * 40))
+                if x1 < idx_tip[0] < x2 and y1 < idx_tip[1] < y2:
+                    current_color = col # Change active color
+
+            # PINCH TO DRAW
+            if math.dist(idx_tip, thumb_tip) < 30:
+                if hand_idx in prev_points:
+                    cv2.line(canvas, prev_points[hand_idx], idx_tip, current_color, 4)
+                prev_points[hand_idx] = idx_tip
+                cv2.circle(frame, idx_tip, 10, (255, 255, 255), 2) # Tip glow
+            else:
+                prev_points.pop(hand_idx, None)
+
+            # Draw Hand on Hologram
+            for start, end in HAND_BONES: cv2.line(hologram, pts[start], pts[end], (0, 255, 0), 1)
+
+    # --- 4. DISPLAY ---
+    webcam_view = cv2.addWeighted(frame, 1, canvas, 1, 0)
+    cv2.imshow('Laser Paint HUD', np.hstack((webcam_view, hologram)))
+
+    key = cv2.waitKey(1) & 0xFF
+    if key == ord('q'): break
+    if key == ord('c'): canvas = np.zeros((h, w, 3), dtype=np.uint8) # Clear button
+
+cap.release()
+cv2.destroyAllWindows()
