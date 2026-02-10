@@ -1,0 +1,90 @@
+import cv2
+import torch
+import numpy as np
+import math
+from collections import deque
+
+# --- 1. SETUP ---
+model_type = "MiDaS_small" 
+midas = torch.hub.load("intel-isl/MiDaS", model_type, trust_repo=True)
+device = torch.device("cuda") if torch.cuda.is_available() else torch.device("cpu")
+midas.to(device); midas.eval()
+
+midas_transforms = torch.hub.load("intel-isl/MiDaS", "transforms")
+transform = midas_transforms.small_transform
+
+cap = cv2.VideoCapture(0)
+
+# VOXEL LIMIT
+# Large pixels take up more space, so 6000 is usually the "sweet spot"
+MAX_POINTS = 6000 
+point_cloud = deque(maxlen=MAX_POINTS)
+
+while cap.isOpened():
+    success, frame = cap.read()
+    if not success: break
+
+    frame = cv2.flip(frame, 1)
+    h, w, _ = frame.shape
+    img_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+
+    # --- 2. AI DEPTH SCAN ---
+    input_batch = transform(img_rgb).to(device)
+    with torch.no_grad():
+        prediction = midas(input_batch)
+        prediction = torch.nn.functional.interpolate(
+            prediction.unsqueeze(1), size=frame.shape[:2], mode="bicubic", align_corners=False
+        ).squeeze()
+    
+    depth_map = prediction.cpu().numpy()
+    depth_norm = (depth_map - depth_map.min()) / (depth_map.max() - depth_map.min() + 1e-5)
+    
+    # --- 3. VOXEL SAMPLING ---
+    # We use a step of 12 so the "big" pixels have room to breathe
+    step = 12 
+    for y in range(0, h, step):
+        for x in range(0, w, step):
+            d = depth_norm[y, x]
+            z_val = (d ** 3) * 700 - 350 
+            
+            color = frame[y, x].tolist()
+            point_cloud.append([x, y, z_val, color[0], color[1], color[2], d])
+
+            # Big pixels on Webcam side
+            # Node size increases with depth (closeness)
+            cv2.circle(frame, (x, y), int(2 + d*4), (0, int(d*255), 0), -1)
+
+    # --- 4. RENDER BIG-PIXEL 3D VIEW ---
+    construct = np.zeros((h, w, 3), dtype=np.uint8)
+    
+    for pt in point_cloud:
+        px, py, pz, pb, pg, pr, d = pt
+        
+        # Perspective projection
+        factor = (pz + 1000) / 1000 
+        view_x = int((px - w/2) * factor + w/2)
+        view_y = int((py - h/2) * factor + h/2)
+
+        if 0 <= view_x < w and 0 <= view_y < h:
+            # BIG PIXEL SETTINGS:
+            # We use a radius of 3-5 to make them look like chunky blocks
+            pixel_size = int(3 + d * 3)
+            
+            # Draw the main pixel
+            cv2.circle(construct, (view_x, view_y), pixel_size, (pb, pg, pr), -1)
+            
+            # Add a "Highlight" on the top left of each pixel for a 3D effect
+            cv2.circle(construct, (view_x-1, view_y-1), 1, (255, 255, 255), -1)
+
+    # --- 5. DISPLAY ---
+    combined = np.hstack((frame, construct))
+    
+    # Add a border between views
+    cv2.line(combined, (w, 0), (w, h), (0, 255, 0), 2)
+    
+    cv2.imshow('Big-Pixel Voxel HUD', combined)
+    
+    if cv2.waitKey(1) & 0xFF == ord('q'): break
+
+cap.release()
+cv2.destroyAllWindows()
